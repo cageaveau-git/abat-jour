@@ -1,0 +1,103 @@
+name: allume l'abat-jour
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+
+env: # non sensibles
+  WP_DB_NAME: wordpress
+  WP_DB_HOST: db:3306
+
+jobs:
+  ci-cd:
+    runs-on: ubuntu-latest
+    env:
+      # sensibles
+      WP_DB_USER: ${{ secrets.WP_DB_USER }}
+      WP_DB_PASSWORD: ${{ secrets.WP_DB_PASSWORD }}
+      # image Docker à pousser
+      DOCKER_IMAGE: ${{ secrets.DOCKER_HUB_USERNAME }}/wordpress-ci:latest
+
+    steps:
+      - name: Vérification du code
+        uses: actions/checkout@v4
+
+      - name: Configuration Docker
+        run: |
+          docker --version
+          docker compose version || true
+
+      - name: Configure docker-compose.yml
+        run: |
+          cat > docker-compose.yml <<'EOF'
+          version: '3.8'
+          services:
+            db:
+              container_name: db
+              image: mysql:8.0
+              environment:
+                MYSQL_DATABASE: ${WP_DB_NAME}
+                MYSQL_USER: ${WP_DB_USER}
+                MYSQL_PASSWORD: ${WP_DB_PASSWORD}
+                MYSQL_ROOT_PASSWORD: ${WP_DB_PASSWORD}
+              ports:
+                - "3306:3306"
+              healthcheck:
+                test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+                interval: 5s
+                retries: 5
+
+            wordpress:
+              image: wordpress:latest
+              depends_on:
+                db:
+                  condition: service_healthy
+              ports:
+                - "8080:80"
+              environment:
+                WORDPRESS_DB_HOST: ${WP_DB_HOST}
+                WORDPRESS_DB_USER: ${WP_DB_USER}
+                WORDPRESS_DB_PASSWORD: ${WP_DB_PASSWORD}
+                WORDPRESS_DB_NAME: ${WP_DB_NAME}
+
+            adminer:
+              image: adminer
+              ports:
+                - "8081:8080"
+          EOF
+
+      - name: Lance Docker Compose
+        run: docker compose up -d
+
+      - name: Wait for MySQL to be ready
+        run: |
+          for i in {1..12}; do
+            docker compose exec -T db mysql -h127.0.0.1 -u"$WP_DB_USER" -p"$WP_DB_PASSWORD" -e "SELECT 1" && break
+            echo "Waiting for MySQL..."
+            sleep 5
+          done
+
+      - name: Test WordPress
+        run: |
+          curl -f http://localhost:8080 || exit 1
+          docker compose exec -T db mysql -h127.0.0.1 -u"$WP_DB_USER" -p"$WP_DB_PASSWORD" -e "SHOW DATABASES LIKE '$WP_DB_NAME';"
+
+      - name: Prépare l'image Docker et créé un TAG
+        run: |
+          docker pull wordpress:latest
+          docker tag wordpress:latest "$DOCKER_IMAGE"
+
+      - name: Connexion au Docker registry
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      - name: Push Image Docker
+        run: docker push "$DOCKER_IMAGE"
+
+      - name: Nettoyage
+        if: always()
+        run: docker compose down
+
